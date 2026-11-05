@@ -1,0 +1,834 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(
+    ChangeNotifierProvider(
+      create: (_) => RecipeProvider()..initialize(),
+      child: const TastyBookApp(),
+    ),
+  );
+}
+
+// ============================================================
+// RECIPE MODEL
+// ============================================================
+
+class Recipe {
+  final String id;
+  final String name;
+  final String image;
+  final String category;
+  final String area;
+  final String instructions;
+  final List<String> ingredients;
+
+  const Recipe({
+    required this.id,
+    required this.name,
+    required this.image,
+    required this.category,
+    required this.area,
+    required this.instructions,
+    required this.ingredients,
+  });
+
+  factory Recipe.fromApiJson(Map<String, dynamic> json) {
+    final ingredients = <String>[];
+
+    for (var i = 1; i <= 20; i++) {
+      final ingredient = json['strIngredient$i']?.toString().trim() ?? '';
+      final measure = json['strMeasure$i']?.toString().trim() ?? '';
+
+      if (ingredient.isNotEmpty) {
+        ingredients.add('$measure $ingredient'.trim());
+      }
+    }
+
+    return Recipe(
+      id: json['idMeal']?.toString() ?? '',
+      name: json['strMeal']?.toString() ?? 'Unknown Recipe',
+      image: json['strMealThumb']?.toString() ?? '',
+      category: json['strCategory']?.toString() ?? 'General',
+      area: json['strArea']?.toString() ?? 'Unknown',
+      instructions: json['strInstructions']?.toString() ?? '',
+      ingredients: ingredients,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'image': image,
+        'category': category,
+        'area': area,
+        'instructions': instructions,
+        'ingredients': ingredients,
+      };
+
+  factory Recipe.fromLocalJson(Map<String, dynamic> json) {
+    return Recipe(
+      id: json['id']?.toString() ?? '',
+      name: json['name']?.toString() ?? '',
+      image: json['image']?.toString() ?? '',
+      category: json['category']?.toString() ?? '',
+      area: json['area']?.toString() ?? '',
+      instructions: json['instructions']?.toString() ?? '',
+      ingredients: (json['ingredients'] as List? ?? [])
+          .map((item) => item.toString())
+          .toList(),
+    );
+  }
+}
+
+// ============================================================
+// API SERVICE
+// ============================================================
+
+class RecipeService {
+  static const String baseUrl =
+      'https://www.themealdb.com/api/json/v1/1';
+
+  Future<List<Recipe>> fetchRecipes() async {
+    final uri = Uri.parse('$baseUrl/search.php?s=');
+    final response = await http
+        .get(uri)
+        .timeout(const Duration(seconds: 20));
+
+    if (response.statusCode != 200) {
+      throw Exception('Server returned ${response.statusCode}');
+    }
+
+    final dynamic decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('Invalid API response');
+    }
+
+    final meals = decoded['meals'];
+    if (meals == null) return [];
+    if (meals is! List) {
+      throw Exception('Invalid recipe list');
+    }
+
+    return meals
+        .whereType<Map<String, dynamic>>()
+        .map(Recipe.fromApiJson)
+        .toList();
+  }
+}
+
+// ============================================================
+// LOCAL STORAGE SERVICE
+// ============================================================
+
+class StorageService {
+  static const String personalKey = 'tastybook_personal_recipes';
+  static const String favouriteKey = 'tastybook_favourite_ids';
+
+  Future<List<Recipe>> loadPersonalRecipes() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(personalKey);
+    if (raw == null || raw.isEmpty) return [];
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return [];
+      return decoded
+          .whereType<Map<String, dynamic>>()
+          .map(Recipe.fromLocalJson)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> savePersonalRecipes(List<Recipe> recipes) async {
+    final prefs = await SharedPreferences.getInstance();
+    final data = recipes.map((recipe) => recipe.toJson()).toList();
+    await prefs.setString(personalKey, jsonEncode(data));
+  }
+
+  Future<Set<String>> loadFavouriteIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList(favouriteKey) ?? <String>[]).toSet();
+  }
+
+  Future<void> saveFavouriteIds(Set<String> ids) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(favouriteKey, ids.toList());
+  }
+}
+
+// ============================================================
+// PROVIDER / STATE MANAGEMENT
+// ============================================================
+
+class RecipeProvider extends ChangeNotifier {
+  final RecipeService _recipeService = RecipeService();
+  final StorageService _storageService = StorageService();
+
+  List<Recipe> onlineRecipes = [];
+  List<Recipe> personalRecipes = [];
+  Set<String> favouriteIds = {};
+
+  bool isLoading = false;
+  bool isInitialized = false;
+  String? errorMessage;
+
+  List<Recipe> get allRecipes => [
+        ...onlineRecipes,
+        ...personalRecipes,
+      ];
+
+  List<Recipe> get favouriteRecipes => allRecipes
+      .where((recipe) => favouriteIds.contains(recipe.id))
+      .toList();
+
+  bool isFavourite(Recipe recipe) => favouriteIds.contains(recipe.id);
+
+  Future<void> initialize() async {
+    if (isInitialized) return;
+    isInitialized = true;
+
+    try {
+      personalRecipes = await _storageService.loadPersonalRecipes();
+      favouriteIds = await _storageService.loadFavouriteIds();
+      notifyListeners();
+    } catch (_) {
+      // The app can still work with online recipes if local storage fails.
+    }
+
+    await loadRecipes();
+  }
+
+  Future<void> loadRecipes() async {
+    isLoading = true;
+    errorMessage = null;
+    notifyListeners();
+
+    try {
+      onlineRecipes = await _recipeService.fetchRecipes();
+    } catch (_) {
+      errorMessage =
+          'Could not load recipes. Check your internet connection and try again.';
+    }
+
+    isLoading = false;
+    notifyListeners();
+  }
+
+  Future<void> addRecipe(Recipe recipe) async {
+    personalRecipes.insert(0, recipe);
+    notifyListeners();
+
+    try {
+      await _storageService.savePersonalRecipes(personalRecipes);
+    } catch (_) {
+      personalRecipes.removeWhere((item) => item.id == recipe.id);
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  Future<void> toggleFavourite(Recipe recipe) async {
+    final wasFavourite = favouriteIds.contains(recipe.id);
+
+    if (wasFavourite) {
+      favouriteIds.remove(recipe.id);
+    } else {
+      favouriteIds.add(recipe.id);
+    }
+    notifyListeners();
+
+    try {
+      await _storageService.saveFavouriteIds(favouriteIds);
+    } catch (_) {
+      if (wasFavourite) {
+        favouriteIds.add(recipe.id);
+      } else {
+        favouriteIds.remove(recipe.id);
+      }
+      notifyListeners();
+      rethrow;
+    }
+  }
+}
+
+// ============================================================
+// MAIN APP AND THEME
+// ============================================================
+
+class TastyBookApp extends StatelessWidget {
+  const TastyBookApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'TastyBook',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFFE87932),
+        ),
+        scaffoldBackgroundColor: const Color(0xFFFFFAF4),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFFFFFAF4),
+          centerTitle: false,
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+      ),
+      home: const MainScreen(),
+    );
+  }
+}
+
+// ============================================================
+// MAIN NAVIGATION
+// ============================================================
+
+class MainScreen extends StatefulWidget {
+  const MainScreen({super.key});
+
+  @override
+  State<MainScreen> createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  int selectedIndex = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      const HomeScreen(),
+      const AddRecipeScreen(),
+      const FavouritesScreen(),
+    ];
+
+    return Scaffold(
+      body: IndexedStack(
+        index: selectedIndex,
+        children: pages,
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: selectedIndex,
+        onDestinationSelected: (index) {
+          setState(() => selectedIndex = index);
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.home_outlined),
+            selectedIcon: Icon(Icons.home),
+            label: 'Home',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.add_circle_outline),
+            selectedIcon: Icon(Icons.add_circle),
+            label: 'Add Recipe',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.favorite_outline),
+            selectedIcon: Icon(Icons.favorite),
+            label: 'Favourites',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// HOME SCREEN
+// ============================================================
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  String searchText = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = context.watch<RecipeProvider>();
+
+    final recipes = provider.allRecipes.where((recipe) {
+      return recipe.name.toLowerCase().contains(searchText.toLowerCase());
+    }).toList();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'TastyBook 🍳',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh recipes',
+            onPressed: provider.isLoading ? null : provider.loadRecipes,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: provider.loadRecipes,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            const Text(
+              'Discover delicious food!',
+              style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            const Text('Find your next favourite recipe.'),
+            const SizedBox(height: 18),
+            TextField(
+              decoration: const InputDecoration(
+                hintText: 'Search recipes...',
+                prefixIcon: Icon(Icons.search),
+              ),
+              onChanged: (value) {
+                setState(() => searchText = value);
+              },
+            ),
+            const SizedBox(height: 18),
+            if (provider.isLoading && provider.allRecipes.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(40),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (provider.errorMessage != null &&
+                provider.onlineRecipes.isEmpty &&
+                provider.personalRecipes.isEmpty)
+              _ErrorView(
+                message: provider.errorMessage!,
+                onRetry: provider.loadRecipes,
+              )
+            else if (recipes.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(40),
+                child: Center(child: Text('No recipes found.')),
+              )
+            else ...[
+              if (provider.errorMessage != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    'Online recipes are unavailable. Showing saved recipes.',
+                    style: TextStyle(color: Colors.orange.shade900),
+                  ),
+                ),
+              ...recipes.map(
+                (recipe) => RecipeCard(
+                  recipe: recipe,
+                  favourite: provider.isFavourite(recipe),
+                  onFavourite: () => _toggleFavourite(context, recipe),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleFavourite(
+    BuildContext context,
+    Recipe recipe,
+  ) async {
+    try {
+      await context.read<RecipeProvider>().toggleFavourite(recipe);
+    } catch (_) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save favourite.')),
+      );
+    }
+  }
+}
+
+// ============================================================
+// ERROR VIEW
+// ============================================================
+
+class _ErrorView extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+
+  const _ErrorView({
+    required this.message,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(30),
+      child: Column(
+        children: [
+          const Icon(Icons.wifi_off, size: 55),
+          const SizedBox(height: 12),
+          Text(message, textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          FilledButton(
+            onPressed: onRetry,
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// RECIPE CARD
+// ============================================================
+
+class RecipeCard extends StatelessWidget {
+  final Recipe recipe;
+  final bool favourite;
+  final VoidCallback onFavourite;
+
+  const RecipeCard({
+    super.key,
+    required this.recipe,
+    required this.favourite,
+    required this.onFavourite,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 15),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (recipe.image.isNotEmpty)
+            Image.network(
+              recipe.image,
+              height: 175,
+              width: double.infinity,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => const SizedBox(
+                height: 120,
+                child: Center(
+                  child: Icon(Icons.restaurant, size: 45),
+                ),
+              ),
+            ),
+          ListTile(
+            title: Text(
+              recipe.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            subtitle: Text('${recipe.category} • ${recipe.area}'),
+            trailing: IconButton(
+              tooltip: favourite ? 'Remove favourite' : 'Add favourite',
+              onPressed: onFavourite,
+              icon: Icon(
+                favourite ? Icons.favorite : Icons.favorite_border,
+                color: favourite ? Colors.red : null,
+              ),
+            ),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => RecipeDetailScreen(recipe: recipe),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// RECIPE DETAILS SCREEN
+// ============================================================
+
+class RecipeDetailScreen extends StatelessWidget {
+  final Recipe recipe;
+
+  const RecipeDetailScreen({super.key, required this.recipe});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Recipe Details')),
+      body: ListView(
+        padding: const EdgeInsets.all(18),
+        children: [
+          if (recipe.image.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(18),
+              child: Image.network(
+                recipe.image,
+                height: 220,
+                width: double.infinity,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const SizedBox(
+                  height: 140,
+                  child: Center(child: Icon(Icons.restaurant, size: 50)),
+                ),
+              ),
+            ),
+          const SizedBox(height: 18),
+          Text(
+            recipe.name,
+            style: const TextStyle(
+              fontSize: 25,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text('${recipe.category} • ${recipe.area}'),
+          const SizedBox(height: 22),
+          const Text(
+            'Ingredients',
+            style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          if (recipe.ingredients.isEmpty)
+            const Text('No ingredients available.')
+          else
+            ...recipe.ingredients.map(
+              (item) => ListTile(
+                leading: const Icon(Icons.check_circle_outline),
+                title: Text(item),
+                dense: true,
+              ),
+            ),
+          const SizedBox(height: 18),
+          const Text(
+            'Cooking Instructions',
+            style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            recipe.instructions.isEmpty
+                ? 'No instructions available.'
+                : recipe.instructions,
+            style: const TextStyle(fontSize: 15, height: 1.6),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// ADD RECIPE SCREEN
+// ============================================================
+
+class AddRecipeScreen extends StatefulWidget {
+  const AddRecipeScreen({super.key});
+
+  @override
+  State<AddRecipeScreen> createState() => _AddRecipeScreenState();
+}
+
+class _AddRecipeScreenState extends State<AddRecipeScreen> {
+  final formKey = GlobalKey<FormState>();
+  final nameController = TextEditingController();
+  final categoryController = TextEditingController();
+  final areaController = TextEditingController();
+  final ingredientsController = TextEditingController();
+  final instructionsController = TextEditingController();
+
+  @override
+  void dispose() {
+    nameController.dispose();
+    categoryController.dispose();
+    areaController.dispose();
+    ingredientsController.dispose();
+    instructionsController.dispose();
+    super.dispose();
+  }
+
+  String? validateField(String? value, String label) {
+    if (value == null || value.trim().isEmpty) {
+      return 'Please enter $label';
+    }
+    return null;
+  }
+
+  Widget buildField(
+    String label,
+    TextEditingController controller, {
+    int lines = 1,
+    int maxLength = 1000,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 15),
+      child: TextFormField(
+        controller: controller,
+        maxLines: lines,
+        maxLength: maxLength,
+        decoration: InputDecoration(labelText: label),
+        validator: (value) => validateField(value, label),
+      ),
+    );
+  }
+
+  Future<void> saveRecipe() async {
+    if (!formKey.currentState!.validate()) return;
+
+    final ingredients = ingredientsController.text
+        .split(',')
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
+
+    if (ingredients.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter at least one ingredient.')),
+      );
+      return;
+    }
+
+    final recipe = Recipe(
+      id: 'personal_${DateTime.now().microsecondsSinceEpoch}',
+      name: nameController.text.trim(),
+      image: '',
+      category: categoryController.text.trim(),
+      area: areaController.text.trim(),
+      instructions: instructionsController.text.trim(),
+      ingredients: ingredients,
+    );
+
+    try {
+      await context.read<RecipeProvider>().addRecipe(recipe);
+
+      if (!mounted) return;
+
+      nameController.clear();
+      categoryController.clear();
+      areaController.clear();
+      ingredientsController.clear();
+      instructionsController.clear();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Recipe saved on this device!')),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save recipe. Try again.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Add Your Recipe')),
+      body: Form(
+        key: formKey,
+        child: ListView(
+          padding: const EdgeInsets.all(18),
+          children: [
+            const Text(
+              'Share your cooking idea!',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 20),
+            buildField('Recipe Name', nameController, maxLength: 80),
+            buildField('Category', categoryController, maxLength: 50),
+            buildField('Cuisine / Area', areaController, maxLength: 50),
+            buildField(
+              'Ingredients (separate with commas)',
+              ingredientsController,
+              lines: 3,
+            ),
+            buildField(
+              'Cooking Instructions',
+              instructionsController,
+              lines: 5,
+            ),
+            const SizedBox(height: 10),
+            FilledButton.icon(
+              onPressed: saveRecipe,
+              icon: const Icon(Icons.save),
+              label: const Text('Save Recipe'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// FAVOURITES SCREEN
+// ============================================================
+
+class FavouritesScreen extends StatelessWidget {
+  const FavouritesScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = context.watch<RecipeProvider>();
+    final favourites = provider.favouriteRecipes;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('My Favourite Recipes ❤️')),
+      body: favourites.isEmpty
+          ? const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Text(
+                  'No favourites yet!\nTap the heart on a recipe to save it.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 17),
+                ),
+              ),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: favourites.length,
+              itemBuilder: (context, index) {
+                final recipe = favourites[index];
+
+                return RecipeCard(
+                  recipe: recipe,
+                  favourite: true,
+                  onFavourite: () async {
+                    try {
+                      await context
+                          .read<RecipeProvider>()
+                          .toggleFavourite(recipe);
+                    } catch (_) {
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Could not update favourite.'),
+                        ),
+                      );
+                    }
+                  },
+                );
+              },
+            ),
+    );
+  }
+}
